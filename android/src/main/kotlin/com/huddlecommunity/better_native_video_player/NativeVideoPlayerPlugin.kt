@@ -11,7 +11,6 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import io.flutter.plugin.common.PluginRegistry
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
@@ -23,10 +22,6 @@ import io.flutter.plugin.platform.PlatformViewFactory
 @UnstableApi
 class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
     private var activityBinding: ActivityPluginBinding? = null
-
-    private val userLeaveHintListener = PluginRegistry.UserLeaveHintListener {
-        prepareActiveViewForAutomaticPip()
-    }
 
     companion object {
         private const val TAG = "NativeVideoPlayerPlugin"
@@ -49,23 +44,6 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
         }
 
         fun getActivity(): Activity? = currentActivity
-
-        /**
-         * Called right before Android sends the Activity to background.
-         * Enters fullscreen only at this moment, never during player init.
-         */
-        fun prepareActiveViewForAutomaticPip() {
-            Log.d(TAG, "Preparing active view for automatic PiP")
-
-            val prepared = registeredViews.values
-                .toList()
-                .asReversed()
-                .firstOrNull { it.prepareForAutomaticPip() }
-
-            if (prepared == null) {
-                Log.d(TAG, "No active playing view prepared for automatic PiP")
-            }
-        }
 
         /**
          * Get all registered video player views
@@ -183,12 +161,10 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
         Log.d(TAG, "Plugin attached to activity: ${binding.activity}")
         currentActivity = binding.activity
         activityBinding = binding
-        binding.addOnUserLeaveHintListener(userLeaveHintListener)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         Log.d(TAG, "Plugin detached from activity for config changes")
-        activityBinding?.removeOnUserLeaveHintListener(userLeaveHintListener)
         activityBinding = null
         // Don't clear activity - it will be reattached
     }
@@ -197,12 +173,10 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
         Log.d(TAG, "Plugin reattached to activity: ${binding.activity}")
         currentActivity = binding.activity
         activityBinding = binding
-        binding.addOnUserLeaveHintListener(userLeaveHintListener)
     }
 
     override fun onDetachedFromActivity() {
         Log.d(TAG, "Plugin detached from activity")
-        activityBinding?.removeOnUserLeaveHintListener(userLeaveHintListener)
         activityBinding = null
         currentActivity = null
     }

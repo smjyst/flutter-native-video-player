@@ -48,7 +48,8 @@ class NativeVideoPlayerController {
     this.mediaInfo,
     this.allowsPictureInPicture = true,
     this.canStartPictureInPictureAutomatically = true,
-    this.lockToLandscape = true,
+    this.isPipAllowedWhileNotInFullscreen = true,
+    this.lockToLandscape = false,
     this.enableHDR = true,
     this.enableLooping = false,
     this.showNativeControls = true,
@@ -64,8 +65,13 @@ class NativeVideoPlayerController {
       WidgetsBinding.instance.addObserver(_AppLifecycleObserver(this));
     }
 
-    // Set up controller-level event channel for persistent events (PiP, AirPlay)
-    _setupControllerEventChannel();
+    // Set up controller-level event channel for persistent events.
+    // Android does not expose native_video_player_controller_<id>, so do not
+    // subscribe there. Subscribing on Android causes MissingPluginException on
+    // stream cancellation during dispose.
+    if (kIsWeb || !Platform.isAndroid) {
+      _setupControllerEventChannel();
+    }
   }
 
   /// Initialize the controller and wait for the platform view to be created
@@ -129,6 +135,12 @@ class NativeVideoPlayerController {
 
   /// Whether PiP can start automatically when app goes to background (iOS 14.2+)
   final bool canStartPictureInPictureAutomatically;
+
+  /// Whether Android PiP is allowed while the player is not fullscreen.
+  ///
+  /// Set this to false when you want PiP only from fullscreen mode. This also
+  /// prevents automatic Android PiP from inline/detail pages.
+  final bool isPipAllowedWhileNotInFullscreen;
 
   /// Whether to enable HDR playback (default: false)
   /// When set to false, HDR is disabled to prevent washed-out/too-white video appearance
@@ -807,6 +819,7 @@ class NativeVideoPlayerController {
     'allowsPictureInPicture': allowsPictureInPicture,
     'canStartPictureInPictureAutomatically':
         canStartPictureInPictureAutomatically,
+    'isPipAllowedWhileNotInFullscreen': isPipAllowedWhileNotInFullscreen,
     'showNativeControls': _hasCustomOverlay
         ? false
         : showNativeControls, // Hide native controls if we have custom overlay, otherwise use parameter
@@ -1354,10 +1367,11 @@ class NativeVideoPlayerController {
                     _hideOverlayForPip = true;
                     _isOverlayLocked = false;
 
-                    // Enable native controls for PiP mode and enter native fullscreen
-                    // Use method channel directly to avoid state checks in enterFullScreen()
-                    unawaited(setShowNativeControls(true));
-                    unawaited(enterFullScreen());
+                    // Native Android has already moved the PlayerView into an
+                    // Activity-level fullscreen container before PiP. Do NOT call
+                    // enterFullScreen() here: that would open Dart fullscreen after
+                    // the native transition and can happen during/after PiP.
+                    // Just keep Flutter state/overlay in sync.
                   }
                 } else {
                   // Normal fullscreen change from native side (e.g., PiP exit restoration)
@@ -1804,7 +1818,6 @@ class NativeVideoPlayerController {
   /// Returns whether Picture-in-Picture is available on this device
   /// Checks the actual device capabilities rather than just the platform
   /// PiP is available on iOS 14+ and Android 8+ (if the device supports it)
-  /// For Android, also requires the video to be in fullscreen mode
   /// Respects the allowsPictureInPicture setting
   Future<bool> isPictureInPictureAvailable() async {
     // Check if PiP is allowed by controller settings
@@ -1812,12 +1825,11 @@ class NativeVideoPlayerController {
       return false;
     }
 
-    // Use floating package for Android
     if (!kIsWeb && Platform.isAndroid) {
-      // Only available when in fullscreen on Android
-      if (!_state.isFullScreen) {
+      if (!isPipAllowedWhileNotInFullscreen && !_state.isFullScreen) {
         return false;
       }
+
       return await _floating.isPipAvailable;
     }
 
@@ -1851,16 +1863,29 @@ class NativeVideoPlayerController {
     return Rational(16, 9);
   }
 
-  /// Enables automatic PiP on Android when app goes to background
-  /// Only enabled when video is in fullscreen
+  /// Enables automatic PiP on Android when app goes to background.
+  ///
+  /// Important: this method must NOT enter fullscreen. It is called when the
+  /// platform view is created/reconnected, so entering fullscreen here would
+  /// open fullscreen during player initialization. The native Android side
+  /// prepares fullscreen right before PiP via onUserLeaveHint instead.
   Future<void> _enableAutomaticPiP() async {
     if (!kIsWeb &&
         Platform.isAndroid &&
-        canStartPictureInPictureAutomatically &&
-        _state.isFullScreen) {
+        canStartPictureInPictureAutomatically) {
       try {
+        if (!isPipAllowedWhileNotInFullscreen && !_state.isFullScreen) {
+          _floating.cancelOnLeavePiP();
+          debugPrint('Automatic PiP disabled outside fullscreen');
+          return;
+        }
+
         await _floating.enable(OnLeavePiP(aspectRatio: _getPiPAspectRatio()));
-        debugPrint('Automatic PiP enabled (fullscreen mode)');
+        debugPrint(
+          _state.isFullScreen
+              ? 'Automatic PiP enabled (fullscreen)'
+              : 'Automatic PiP enabled (inline)',
+        );
       } catch (e) {
         debugPrint('Error enabling automatic PiP: $e');
       }
@@ -1869,22 +1894,30 @@ class NativeVideoPlayerController {
 
   /// Enters Picture-in-Picture mode immediately
   /// Only works on iOS 14+ and Android 8+
-  /// For Android, only works when video is in fullscreen
+  /// On Android, automatically enters fullscreen first so only the video
+  /// surface appears in the PiP window (not the whole page).
   Future<bool> enterPictureInPicture() async {
     // Use floating package for Android
     if (!kIsWeb && Platform.isAndroid) {
-      // Only allow PiP when in fullscreen
-      if (!_state.isFullScreen) {
-        debugPrint('PiP requires fullscreen mode on Android');
-        return false;
-      }
-
       try {
+        if (!isPipAllowedWhileNotInFullscreen && !_state.isFullScreen) {
+          debugPrint('PiP blocked because player is not fullscreen');
+          return false;
+        }
+        // Enter fullscreen first so only the video surface shows in the PiP
+        // window, not the entire Flutter page.
+        if (!_state.isFullScreen) {
+          debugPrint('PiP: entering fullscreen before PiP');
+          await enterFullScreen();
+          // Give the fullscreen dialog time to appear before PiP kicks in
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+        }
+
         // Emit event to hide overlay before entering PiP
         _emitPipStartedEvent();
 
         // Give overlay time to hide
-        await Future.delayed(const Duration(milliseconds: 200));
+        await Future<void>.delayed(const Duration(milliseconds: 200));
 
         final status = await _floating.enable(
           ImmediatePiP(aspectRatio: _getPiPAspectRatio()),
@@ -1942,7 +1975,7 @@ class NativeVideoPlayerController {
   ///
   /// **Platform Support:**
   /// - iOS: Requires iOS 14.2+ and video must be playing
-  /// - Android: Requires Android 8+ and video must be in fullscreen
+  /// - Android: Requires Android 8+; inline player is supported
   ///
   /// **Returns:**
   /// A Future that completes with true if automatic PiP was successfully enabled
@@ -1961,15 +1994,10 @@ class NativeVideoPlayerController {
     }
 
     try {
-      // Android: enable through floating package
+      // Android: enable through floating package. This must not enter fullscreen
+      // during setup/init; native onUserLeaveHint prepares fullscreen only when
+      // automatic PiP is actually about to start.
       if (!kIsWeb && Platform.isAndroid) {
-        // Only enable if in fullscreen
-        if (!_state.isFullScreen) {
-          debugPrint(
-            'Cannot enable automatic PiP on Android: video must be in fullscreen',
-          );
-          return false;
-        }
         await _enableAutomaticPiP();
         return true;
       }
@@ -2264,6 +2292,10 @@ class NativeVideoPlayerController {
   /// }
   /// ```
   Future<void> releaseResources() async {
+    if (!kIsWeb && Platform.isAndroid) {
+      _floating.cancelOnLeavePiP();
+    }
+
     // Pause playback
     await pause();
 
@@ -2388,7 +2420,7 @@ class NativeVideoPlayerController {
 
     // Teardown controller-level event channel on native side
     try {
-      const MethodChannel('native_video_player').invokeMethod<void>(
+      await const MethodChannel('native_video_player').invokeMethod<void>(
         'teardownControllerEventChannel',
         {'controllerId': id},
       );
@@ -2396,7 +2428,24 @@ class NativeVideoPlayerController {
       debugPrint('Failed to teardown controller event channel: $e');
     }
 
-    // Dispose native player resources (removes shared player from manager)
+    // Disable automatic Android PiP before disposing this controller.
+    if (!kIsWeb && Platform.isAndroid) {
+      _floating.cancelOnLeavePiP();
+    }
+
+    // Dispose native player resources by controller id. This works even if the
+    // platform view has already been disposed/removed from the registry.
+    try {
+      await const MethodChannel('native_video_player').invokeMethod<void>(
+        'disposeController',
+        {'controllerId': id},
+      );
+    } catch (e) {
+      debugPrint('Failed to dispose native controller by id: $e');
+    }
+
+    // Keep the old view-based dispose as a fallback when a platform view is
+    // still alive.
     await _methodChannel?.dispose();
 
     // Close all stream controllers

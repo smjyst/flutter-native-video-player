@@ -74,6 +74,16 @@ class VideoPlayerView(
     // Fullscreen dialog
     private var fullscreenDialog: Dialog? = null
 
+    // Fullscreen container used only for automatic Android PiP preparation.
+    // A dialog is not reliable here because Android PiP snapshots the Activity
+    // window, not an arbitrary dialog window. For PiP we temporarily move the
+    // PlayerView into the Activity content root so the Activity itself becomes
+    // video-only before the system creates the PiP window.
+    private var autoPipFullscreenContainer: FrameLayout? = null
+    private var originalPlayerParent: ViewGroup? = null
+    private var originalPlayerLayoutParams: ViewGroup.LayoutParams? = null
+    private var originalUseController: Boolean? = null
+
     // Store original system UI flags and orientation
     private var originalSystemUiVisibility: Int = 0
     private var originalOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -360,6 +370,125 @@ class VideoPlayerView(
         }
     }
 
+    /**
+     * Prepares this view for automatic Android PiP.
+     *
+     * This is intentionally called from native onUserLeaveHint, right before
+     * Android creates the PiP window. Doing it from Dart is too late and doing
+     * it during automatic PiP setup opens fullscreen during initialization.
+     */
+    fun prepareForAutomaticPip(): Boolean {
+        if (isDisposed) {
+            Log.d(TAG, "Skipping automatic PiP prepare - view is disposed")
+            return false
+        }
+
+        if (!player.isPlaying) {
+            Log.d(TAG, "Skipping automatic PiP prepare - player is not playing")
+            return false
+        }
+
+        if (isFullScreen) {
+            Log.d(TAG, "Automatic PiP prepare - already fullscreen")
+            return true
+        }
+
+        val activity = NativeVideoPlayerPlugin.getActivity() ?: getActivity(context)
+        if (activity == null) {
+            Log.e(TAG, "Cannot prepare automatic PiP - Activity is null")
+            return false
+        }
+
+        Log.d(TAG, "Automatic PiP prepare - moving player into Activity fullscreen container")
+        enterAutomaticPipFullscreenNative(activity)
+        isFullScreen = true
+        updateFullscreenButtonState(true)
+
+        // Tell Flutter this fullscreen change is only for PiP preparation.
+        // Flutter may hide overlays, but the important part has already happened natively.
+        eventHandler.sendEvent(
+            "fullscreenChange",
+            mapOf(
+                "isFullscreen" to true,
+                "fromAndroidPipPreparation" to true
+            )
+        )
+
+        return true
+    }
+
+    /**
+     * Enters a special fullscreen mode for automatic Android PiP.
+     *
+     * This does NOT use Dialog. Android PiP snapshots/resizes the Activity window,
+     * so the PlayerView must be inside the Activity content hierarchy before PiP
+     * starts. Otherwise the PiP window shows the whole Flutter page.
+     */
+    private fun enterAutomaticPipFullscreenNative(activity: Activity) {
+        if (autoPipFullscreenContainer != null) {
+            Log.d(TAG, "Automatic PiP fullscreen container already active")
+            return
+        }
+
+        originalOrientation = activity.requestedOrientation
+        originalSystemUiVisibility = activity.window?.decorView?.systemUiVisibility ?: 0
+        originalUseController = playerView.useController
+
+        activity.window?.let { activityWindow ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val controller = WindowCompat.getInsetsController(activityWindow, activityWindow.decorView)
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            } else {
+                @Suppress("DEPRECATION")
+                activityWindow.decorView.systemUiVisibility = (
+                    View.SYSTEM_UI_FLAG_FULLSCREEN
+                        or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    )
+            }
+        }
+
+        originalPlayerParent = playerView.parent as? ViewGroup
+        originalPlayerLayoutParams = playerView.layoutParams
+        originalPlayerParent?.removeView(playerView)
+
+        // Keep native controls enabled in this temporary fullscreen mode. They do
+        // not appear inside Android PiP, but they give the user a way to exit
+        // fullscreen if the app is restored from PiP.
+        playerView.useController = true
+
+        val contentRoot = activity.findViewById<ViewGroup>(android.R.id.content)
+        val fullscreenContainer = FrameLayout(activity).apply {
+            setBackgroundColor(android.graphics.Color.BLACK)
+            fitsSystemWindows = false
+        }
+
+        contentRoot.addView(
+            fullscreenContainer,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        fullscreenContainer.addView(
+            playerView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        autoPipFullscreenContainer = fullscreenContainer
+        activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+
+        Log.d(TAG, "Entered automatic PiP Activity fullscreen container")
+    }
+
 
     /**
      * Handles fullscreen toggle natively by moving the player view between container and fullscreen dialog
@@ -533,8 +662,8 @@ class VideoPlayerView(
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
 
-        // Allow all orientations in fullscreen
-        activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+        // Allow all orientations in fullscreen including portrait
+        activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
         Log.d(TAG, "Entered fullscreen natively")
     }
@@ -544,6 +673,29 @@ class VideoPlayerView(
      */
     private fun exitFullscreenNative(activity: Activity) {
         Log.d(TAG, "Exiting fullscreen natively")
+
+        autoPipFullscreenContainer?.let { pipContainer ->
+            Log.d(TAG, "Restoring player from automatic PiP fullscreen container")
+
+            (playerView.parent as? ViewGroup)?.removeView(playerView)
+            (pipContainer.parent as? ViewGroup)?.removeView(pipContainer)
+            autoPipFullscreenContainer = null
+
+            val restoreParent = originalPlayerParent ?: containerView
+            val restoreParams = originalPlayerLayoutParams ?: FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+
+            if (playerView.parent == null) {
+                restoreParent.addView(playerView, restoreParams)
+            }
+
+            originalUseController?.let { playerView.useController = it }
+            originalUseController = null
+            originalPlayerParent = null
+            originalPlayerLayoutParams = null
+        }
 
         fullscreenDialog?.let { dialog ->
             // Remove player view from dialog
@@ -729,16 +881,11 @@ class VideoPlayerView(
         player.removeListener(observer)
         observer.release()
 
-        // Clean up channels
-        // First call onCancel to properly clean up the event sink
-        // This prevents MissingPluginException when Flutter tries to cancel the subscription
-        try {
-            eventHandler.onCancel(null)
-        } catch (e: Exception) {
-            Log.w(TAG, "Error calling onCancel on event handler: ${e.message}")
-        }
-        // Then set the stream handler to null
-        eventChannel.setStreamHandler(null)
+        // Do not clear the EventChannel StreamHandler here. Flutter may cancel
+        // its stream subscription after the platform view has been disposed. If
+        // the handler is already null, Flutter throws MissingPluginException on
+        // EventChannel.cancel. Keeping the handler installed lets the cancel
+        // message be handled safely by VideoPlayerEventHandler.onCancel().
 
         // Clear media info
         currentMediaInfo = null
@@ -757,10 +904,12 @@ class VideoPlayerView(
 
             // Unregister this view and notify remaining views to reconnect their surfaces
             SharedPlayerManager.unregisterView(controllerId, viewId)
+            NativeVideoPlayerPlugin.unregisterView(viewId)
         } else {
             // Only release if not shared (for non-shared players, fully clean up media session)
             notificationHandler.release()
             player.release()
+            NativeVideoPlayerPlugin.unregisterView(viewId)
         }
     }
 }

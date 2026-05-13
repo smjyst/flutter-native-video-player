@@ -11,6 +11,7 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.PluginRegistry
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
@@ -21,6 +22,12 @@ import io.flutter.plugin.platform.PlatformViewFactory
  */
 @UnstableApi
 class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
+    private var activityBinding: ActivityPluginBinding? = null
+
+    private val userLeaveHintListener = PluginRegistry.UserLeaveHintListener {
+        prepareActiveViewForAutomaticPip()
+    }
+
     companion object {
         private const val TAG = "NativeVideoPlayerPlugin"
         private const val VIEW_TYPE = "native_video_player"
@@ -42,6 +49,23 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
         }
 
         fun getActivity(): Activity? = currentActivity
+
+        /**
+         * Called right before Android sends the Activity to background.
+         * Enters fullscreen only at this moment, never during player init.
+         */
+        fun prepareActiveViewForAutomaticPip() {
+            Log.d(TAG, "Preparing active view for automatic PiP")
+
+            val prepared = registeredViews.values
+                .toList()
+                .asReversed()
+                .firstOrNull { it.prepareForAutomaticPip() }
+
+            if (prepared == null) {
+                Log.d(TAG, "No active playing view prepared for automatic PiP")
+            }
+        }
 
         /**
          * Get all registered video player views
@@ -70,8 +94,22 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
                     val args = call.arguments as? Map<*, *>
                     val controllerId = args?.get("controllerId") as? Int
                     Log.d(TAG, "teardownControllerEventChannel called for controller: $controllerId")
-                    // On Android, controller-level EventChannels are managed by Flutter
-                    // This is a no-op on Android, but we handle it to prevent errors
+                    result.success(null)
+                    return@setMethodCallHandler
+                }
+                "disposeController" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val controllerId = args?.get("controllerId") as? Int
+                    if (controllerId == null) {
+                        result.error("INVALID_ARGUMENT", "controllerId is required", null)
+                        return@setMethodCallHandler
+                    }
+
+                    Log.d(TAG, "disposeController called for controller: $controllerId")
+                    SharedPlayerManager.removePlayer(
+                        binding.applicationContext,
+                        controllerId
+                    )
                     result.success(null)
                     return@setMethodCallHandler
                 }
@@ -144,20 +182,28 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         Log.d(TAG, "Plugin attached to activity: ${binding.activity}")
         currentActivity = binding.activity
+        activityBinding = binding
+        binding.addOnUserLeaveHintListener(userLeaveHintListener)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         Log.d(TAG, "Plugin detached from activity for config changes")
+        activityBinding?.removeOnUserLeaveHintListener(userLeaveHintListener)
+        activityBinding = null
         // Don't clear activity - it will be reattached
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         Log.d(TAG, "Plugin reattached to activity: ${binding.activity}")
         currentActivity = binding.activity
+        activityBinding = binding
+        binding.addOnUserLeaveHintListener(userLeaveHintListener)
     }
 
     override fun onDetachedFromActivity() {
         Log.d(TAG, "Plugin detached from activity")
+        activityBinding?.removeOnUserLeaveHintListener(userLeaveHintListener)
+        activityBinding = null
         currentActivity = null
     }
 }

@@ -33,7 +33,7 @@ import UIKit
             if call.method == "disposeController" {
                 if let args = call.arguments as? [String: Any],
                    let controllerId = args["controllerId"] as? Int {
-                    print("🗑️ Plugin disposing native controller by id: \(controllerId)")
+                    print("🗑️ Plugin-level disposeController for controllerId: \(controllerId)")
                     SharedPlayerManager.shared.removePlayer(for: controllerId)
                     result(nil)
                 } else {

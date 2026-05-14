@@ -1,6 +1,7 @@
 import AVFoundation
 import AVKit
 import Flutter
+import MediaPlayer
 
 // MARK: - Shared Player Manager
 
@@ -261,14 +262,20 @@ class SharedPlayerManager: NSObject {
         print("🗑️ [SharedPlayerManager] removePlayer called for controllerId: \(controllerId)")
         print("📊 [SharedPlayerManager] Current players count: \(players.count), players: \(players.keys.sorted())")
 
-        // Explicit controller disposal is the only place where PiP/automatic PiP
-        // is intentionally disabled and native resources are torn down.
-        if #available(iOS 14.2, *) {
-            setAutomaticPiPEnabled(for: controllerId, enabled: false)
-        }
-
         // First stop all views using this player
         stopAllViewsForController(controllerId)
+
+        // Full controller-level media session cleanup. Platform view deinit must not do
+        // this because fullscreen views can be disposed while the controller should keep
+        // PiP/Now Playing alive. Explicit controller dispose is the correct teardown point.
+        RemoteCommandManager.shared.removeAllTargets()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            print("🔇 [SharedPlayerManager] Deactivated audio session for controller ID: \(controllerId)")
+        } catch {
+            print("⚠️ [SharedPlayerManager] Failed to deactivate audio session: \(error.localizedDescription)")
+        }
 
         // Remove player from manager
         print("🧹 [SharedPlayerManager] Removing player from players dict for controllerId: \(controllerId)")

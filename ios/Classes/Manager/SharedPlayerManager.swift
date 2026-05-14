@@ -261,6 +261,12 @@ class SharedPlayerManager: NSObject {
         print("🗑️ [SharedPlayerManager] removePlayer called for controllerId: \(controllerId)")
         print("📊 [SharedPlayerManager] Current players count: \(players.count), players: \(players.keys.sorted())")
 
+        // Explicit controller disposal is the only place where PiP/automatic PiP
+        // is intentionally disabled and native resources are torn down.
+        if #available(iOS 14.2, *) {
+            setAutomaticPiPEnabled(for: controllerId, enabled: false)
+        }
+
         // First stop all views using this player
         stopAllViewsForController(controllerId)
 
@@ -555,30 +561,9 @@ class SharedPlayerManager: NSObject {
                 }
             }
             
-            // Prefer the Dart fullscreen view when it exists.
-            // On iOS, automatic PiP must be enabled on the AVPlayerViewController that is
-            // currently visible/attached. After entering Dart fullscreen, the old inline view
-            // may still be the stored primary view, so enabling auto PiP there makes Home/tray
-            // from fullscreen unreliable or completely no-op.
-            var enabledOnView = false
-            for (viewKey, wrapper) in videoPlayerViews {
-                if let view = wrapper.view,
-                   view.controllerId == controllerId,
-                   view.isDartFullscreenView,
-                   view.canStartPictureInPictureAutomatically {
-                    let wasBefore = view.playerViewController.canStartPictureInPictureAutomaticallyFromInline
-                    view.playerViewController.canStartPictureInPictureAutomaticallyFromInline = true
-                    let isAfter = view.playerViewController.canStartPictureInPictureAutomaticallyFromInline
-                    primaryViewIdForController[controllerId] = view.viewId
-                    print("   → ViewId \(viewKey): \(wasBefore) → \(isAfter) [DART FULLSCREEN]")
-                    print("   ✅ Enabled on Dart fullscreen platform view for controller \(controllerId)")
-                    enabledOnView = true
-                    break
-                }
-            }
-
             // Then enable ONLY the primary view (the one that most recently called play)
-            if !enabledOnView, let primaryViewId = primaryViewIdForController[controllerId] {
+            var enabledOnView = false
+            if let primaryViewId = primaryViewIdForController[controllerId] {
                 let key = "\(primaryViewId)"
                 if let wrapper = videoPlayerViews[key], let view = wrapper.view {
                     print("   🔍 Checking primary view \(primaryViewId):")

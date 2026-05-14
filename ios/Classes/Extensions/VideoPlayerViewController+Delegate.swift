@@ -157,14 +157,11 @@ extension VideoPlayerView: AVPlayerViewControllerDelegate {
             }
         }
 
-        // Re-enable automatic PiP after every PiP stop if automatic PiP was requested.
-        // The previous logic only re-enabled after MANUAL PiP, but automatic PiP also
-        // disables itself in willStartPictureInPicture. That made later Home/tray PiP
-        // unreliable after a fullscreen/background cycle.
+        // Re-enable automatic PiP if this was a MANUAL PiP session and automatic PiP was requested
+        // For automatic PiP sessions, it will auto re-enable when video plays again
         if #available(iOS 14.2, *) {
-            if let controllerIdValue = controllerId, canStartPictureInPictureAutomatically {
-                print("🎬 Re-enabling automatic PiP after AVPlayerViewController PiP stop")
-                SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
+            if wasManualPiP, let controllerIdValue = controllerId, canStartPictureInPictureAutomatically {
+                print("🎬 Re-enabling automatic PiP after MANUAL PiP stop")
                 SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
             }
         }
@@ -187,16 +184,6 @@ extension VideoPlayerView: AVPlayerViewControllerDelegate {
 
     public func playerViewController(_ playerViewController: AVPlayerViewController, failedToStartPictureInPictureWithError error: Error) {
         print("❌ PiP failed to start (AVPlayerViewController): \(error.localizedDescription)")
-
-        isPipCurrentlyActive = false
-
-        if #available(iOS 14.2, *) {
-            if let controllerIdValue = controllerId, canStartPictureInPictureAutomatically {
-                print("🎬 Re-enabling automatic PiP after AVPlayerViewController PiP failure")
-                SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
-                SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
-            }
-        }
     }
     
     // This delegate method is called when automatic PiP is about to start (iOS 14.2+)
@@ -476,23 +463,9 @@ extension VideoPlayerView: AVPictureInPictureControllerDelegate {
     public func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
         print("❌ Custom PiP controller failed to start: \(error.localizedDescription)")
         
-        isPipCurrentlyActive = false
-
         // Ensure view is visible if PiP fails
         playerViewController.view.isHidden = false
         playerViewController.view.alpha = 1.0
-
-        // Drop the custom PiP controller so it does not keep owning the player layer
-        // and block AVPlayerViewController automatic PiP afterward.
-        pipController = nil
-
-        if #available(iOS 14.2, *) {
-            if let controllerIdValue = controllerId, canStartPictureInPictureAutomatically {
-                print("🎬 Re-enabling automatic PiP after custom PiP failure")
-                SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
-                SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
-            }
-        }
     }
     
     public func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {

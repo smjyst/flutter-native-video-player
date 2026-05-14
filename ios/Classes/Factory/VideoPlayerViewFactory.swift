@@ -30,6 +30,18 @@ import UIKit
                 return
             }
 
+            if call.method == "disposeController" {
+                if let args = call.arguments as? [String: Any],
+                   let controllerId = args["controllerId"] as? Int {
+                    print("🗑️ Plugin disposing native controller by id: \(controllerId)")
+                    SharedPlayerManager.shared.removePlayer(for: controllerId)
+                    result(nil)
+                } else {
+                    result(FlutterError(code: "INVALID_ARGUMENT", message: "Controller ID is required", details: nil))
+                }
+                return
+            }
+
             // Forward view-level methods to the appropriate view
             if let args = call.arguments as? [String: Any],
                let viewId = args["viewId"] as? Int64,

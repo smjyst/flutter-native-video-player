@@ -257,18 +257,15 @@ import QuartzCore
             if #available(iOS 14.2, *) {
                 let isActiveForAutoPiP = SharedPlayerManager.shared.isControllerActiveForAutoPiP(controllerIdValue)
                 let isPlaying = player?.rate ?? 0 > 0
-                let shouldClaimAutoPiP = isDartFullscreenView || isActiveForAutoPiP || isPlaying
 
-                if shouldClaimAutoPiP {
-                    print("🎬 Controller state - dartFullscreen: \(isDartFullscreenView), activeForAutoPiP: \(isActiveForAutoPiP), isPlaying: \(isPlaying)")
+                if isActiveForAutoPiP || isPlaying {
+                    print("🎬 Controller state - activeForAutoPiP: \(isActiveForAutoPiP), isPlaying: \(isPlaying)")
                     if canStartPictureInPictureAutomatically {
                         // Check if manual PiP is active - if so, skip re-enabling automatic PiP
                         if SharedPlayerManager.shared.isManualPiPActive(controllerIdValue) {
                             print("   ⚠️ Skipping automatic PiP re-enable - manual PiP is active")
                         } else {
-                            // Set this new view as the primary view. This is especially important
-                            // for Dart fullscreen: the previous inline view may still be primary,
-                            // but iOS automatic PiP must be enabled on the fullscreen AVPlayerViewController.
+                            // Set this new view as the primary view
                             SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
                             // Re-apply automatic PiP settings to enable it on this new view
                             SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
@@ -696,74 +693,48 @@ import QuartzCore
     deinit {
         print("VideoPlayerView deinit for channel: \(channelName), viewId: \(viewId)")
 
-        // Use the isPipCurrentlyActive flag to check if PiP is active
+        // IMPORTANT:
+        // Platform view disposal is NOT controller disposal.
+        // Flutter can dispose/recreate platform views when leaving Dart fullscreen,
+        // rotating, navigating, or rebuilding. On iOS, automatic PiP is tied to an
+        // AVPlayerViewController, so clearing/stopping PiP here can make automatic
+        // PiP stop working after a fullscreen → inline transition.
+        //
+        // Do NOT send synthetic pipStop, do NOT stop PiP, and do NOT disable
+        // automatic PiP from page/platform-view deinit. Real PiP start/stop events
+        // are emitted by AVPlayerViewController/AVPictureInPictureController
+        // delegates. Native resources are released only by explicit controller
+        // disposal through SharedPlayerManager.removePlayer(for:).
         let isPipActiveNow = isPipCurrentlyActive
-
-        // ALWAYS emit PiP state on disposal to ensure Flutter side is synchronized
-        // This is important for state management even if PiP is not active
         if isPipActiveNow {
-            print("⚠️ View being disposed while PiP is active - sending pipStop event")
+            print("📱 View \(viewId) disposed while PiP is active - preserving PiP controller/state")
         } else {
-            print("ℹ️ View being disposed while PiP is inactive - sending pipStop event for state sync")
+            print("📱 View \(viewId) disposed while PiP is inactive - preserving automatic PiP state")
         }
 
-        // Always send pipStop event - either from this view or an alternative
-        if eventSink != nil {
-            // This view still has a listener, send from here
-            sendEvent("pipStop", data: ["isPictureInPicture": false])
-            print("✅ Sent pipStop event from disposing view \(viewId)")
-        } else if let controllerIdValue = controllerId,
-                  let alternativeView = SharedPlayerManager.shared.findAnotherViewForController(controllerIdValue, excluding: viewId),
-                  alternativeView.eventSink != nil {
-            // Send from alternative view if it exists and has a listener
-            alternativeView.sendEvent("pipStop", data: ["isPictureInPicture": false])
-            print("✅ Sent pipStop event from alternative view \(alternativeView.viewId)")
+        // Clean up remote command ownership only if PiP is not active/restoring.
+        // While PiP is active, command ownership must remain stable until the real
+        // PiP delegate stop/restore callbacks run.
+        if !isPipActiveNow && !isPipRestoringUI {
+            cleanupRemoteCommandOwnership()
         } else {
-            print("⚠️ No active view with listener found - pipStop event cannot be sent")
+            print("📱 Skipping remote command cleanup during active/restoring PiP")
         }
 
-        // Try to stop PiP gracefully if it was active
-        if isPipActiveNow {
-            if #available(iOS 14.0, *) {
-                if let pipCtrl = pipController, pipCtrl.isPictureInPictureActive {
-                    pipCtrl.stopPictureInPicture()
-                }
-            }
-        }
-
-        // Clean up remote command ownership (transfer to another view if possible)
-        cleanupRemoteCommandOwnership()
-
-        // Handle automatic PiP transfer for shared players
-        // If this was the primary view (the one with automatic PiP enabled) OR if the player is playing,
-        // we need to transfer automatic PiP to another view using the same controller
-        if #available(iOS 14.2, *), let controllerIdValue = controllerId {
+        // Unregister this platform view from the weak view registry, but do not
+        // disable automatic PiP and do not clear controller-level PiP settings.
+        if let controllerIdValue = controllerId {
             let wasPrimaryView = SharedPlayerManager.shared.isPrimaryView(viewId, for: controllerIdValue)
-            let wasAutoEnabled = SharedPlayerManager.shared.isControllerActiveForAutoPiP(controllerIdValue)
-            let isPlaying = player?.rate ?? 0 > 0
+            SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
 
-            // Transfer automatic PiP if:
-            // 1. This was the primary view AND auto PiP was enabled, OR
-            // 2. The player is currently playing (should maintain auto PiP capability)
-            if (wasPrimaryView && wasAutoEnabled) || isPlaying {
-                print("🎬 View being disposed (primary: \(wasPrimaryView), autoEnabled: \(wasAutoEnabled), playing: \(isPlaying)) - transferring automatic PiP to another view")
-
-                // Disable automatic PiP on this view before unregistering
-                playerViewController.canStartPictureInPictureAutomaticallyFromInline = false
-
-                // Unregister this view first so it won't be found
-                SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
-
-                // Re-enable automatic PiP - this will find and enable a different view
-                // for the same controller (if any exists)
+            // If the disposed view was primary and playback is still running, pick
+            // another existing view for the same controller and enable auto PiP on it.
+            // If no view exists, keep controller settings cached; the next view will
+            // re-enable auto PiP in init/on play.
+            if #available(iOS 14.2, *), wasPrimaryView, !isPipActiveNow {
                 SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
-                print("✅ Automatic PiP transferred to another view for controller \(controllerIdValue)")
-            } else {
-                // Normal unregister for non-primary views
-                SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
             }
         } else {
-            // Normal unregister for non-shared players
             SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
         }
 
@@ -773,21 +744,17 @@ import QuartzCore
             self.timeObserver = nil
         }
 
-        // Only remove observers, don't dispose the player if it's shared
-        // The shared player will be kept alive for reuse
+        // Only remove observers from this view instance. The shared player and any
+        // cached AVPlayerViewController remain alive until explicit controller dispose.
         if let item = player?.currentItem {
             item.removeObserver(self, forKeyPath: "status")
             item.removeObserver(self, forKeyPath: "playbackBufferEmpty")
             item.removeObserver(self, forKeyPath: "playbackLikelyToKeepUp")
         }
 
-        // Remove player observer for timeControlStatus
         player?.removeObserver(self, forKeyPath: "timeControlStatus")
-
-        // Remove player observer for externalPlaybackActive
         player?.removeObserver(self, forKeyPath: "externalPlaybackActive")
 
-        // Remove route detector observer
         if #available(iOS 11.0, *) {
             routeDetector?.removeObserver(self, forKeyPath: "multipleRoutesDetected")
             routeDetector?.isRouteDetectionEnabled = false
@@ -797,60 +764,28 @@ import QuartzCore
         NotificationCenter.default.removeObserver(self)
         methodChannel.setMethodCallHandler(nil)
 
-        // Clean up DRM handler
         drmHandler?.cleanup()
         drmHandler = nil
 
-        // Clear current media info from this view
-        // BUT do NOT clear from SharedPlayerManager if PiP is active
-        // This ensures media controls survive view disposal during PiP
+        // Keep media info cached at controller level. It is used by PiP/Now Playing
+        // after fullscreen views are destroyed and recreated.
         currentMediaInfo = nil
-        if !isPipActiveNow {
-            // Only clear from SharedPlayerManager if PiP is NOT active
-            if let controllerIdValue = controllerId {
-                // But first check if there are other views using this controller
-                let otherViews = SharedPlayerManager.shared.findAllViewsForController(controllerIdValue)
-                if otherViews.count <= 1 {
-                    // This is the last view, safe to clear media info
-                    print("🧹 Clearing media info from SharedPlayerManager (last view)")
-                } else {
-                    print("📱 Keeping media info in SharedPlayerManager (other views exist)")
-                }
-            }
-        } else {
-            print("📱 Keeping media info in SharedPlayerManager (PiP is active)")
-        }
 
-        // Emit current state to all remaining views for this controller
-        // This ensures other views stay in sync when one view is disposed
         if let controllerIdValue = controllerId {
             let remainingViews = SharedPlayerManager.shared.findAllViewsForController(controllerIdValue)
             if !remainingViews.isEmpty {
                 print("📤 Emitting current state to \(remainingViews.count) remaining view(s) for controller \(controllerIdValue)")
-                for view in remainingViews {
-                    // Skip the view being disposed (just in case it's still in the list)
-                    if view.viewId != viewId {
-                        view.emitCurrentState()
-                    }
+                for view in remainingViews where view.viewId != viewId {
+                    view.emitCurrentState()
                 }
             }
         }
 
-        // For Dart fullscreen platform view, release the dedicated VC's player so it tears down.
-        // The shared player and shared VC (inline view) are left untouched.
-        if isDartFullscreenView {
-            playerViewController.player = nil
-            print("✅ Dart fullscreen platform view disposed - released dedicated AVPlayerViewController")
-        }
-
-        // CRITICAL: For shared controllers, player and playerViewController are NOT disposed here
-        // They're managed by SharedPlayerManager and persist across platform view disposal
-        // This ensures PiP delegate callbacks continue to work when navigating between screens
-        // Resources will be disposed when controller.dispose() is called from Dart
-        if controllerId != nil && !isDartFullscreenView {
-            print("✅ Platform view disposed but player AND view controller kept alive for controller ID: \(String(describing: controllerId))")
-        } else if controllerId != nil && isDartFullscreenView {
-            print("✅ Dart fullscreen platform view disposed - shared player/VC kept alive for controller ID: \(String(describing: controllerId))")
+        // Do NOT clear playerViewController.player here, even for Dart fullscreen
+        // views. Some iOS PiP paths keep references through AVPlayerViewController;
+        // explicit controller disposal will release everything.
+        if controllerId != nil {
+            print("✅ Platform view disposed; native player/PiP resources kept for controller ID: \(String(describing: controllerId))")
         } else {
             print("Platform view disposed for non-shared player")
         }
@@ -873,20 +808,6 @@ import QuartzCore
             print("   → Audio session kept active during background/lock")
         } catch {
             print("   ⚠️ Failed to keep audio session active: \(error.localizedDescription)")
-        }
-
-        // When backgrounding from Dart fullscreen, make the currently visible
-        // fullscreen AVPlayerViewController own automatic PiP right before iOS decides
-        // whether to start PiP. Without this, the old inline view may remain primary and
-        // automatic PiP from fullscreen can silently fail.
-        if #available(iOS 14.2, *),
-           wasPlaying,
-           canStartPictureInPictureAutomatically,
-           let controllerIdValue = controllerId,
-           !SharedPlayerManager.shared.isManualPiPActive(controllerIdValue) {
-            SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
-            SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
-            print("   → Ensured this view owns automatic PiP before background (viewId: \(viewId), dartFullscreen: \(isDartFullscreenView))")
         }
 
         // CRITICAL: iOS will pause AVPlayer when screen locks

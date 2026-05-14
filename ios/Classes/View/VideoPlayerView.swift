@@ -21,6 +21,14 @@ import QuartzCore
     var controllerId: Int?
     var pipController: AVPictureInPictureController?
 
+    // Explicit disposal guard. Platform views can be detached before Swift deinit runs,
+    // especially when Flutter opens/closes Dart fullscreen. Without this, old views
+    // keep observers/remote command/PiP ownership alive.
+    private var isPlatformViewDisposed = false
+    var hasItemObservers = false
+    var hasPlayerObservers = false
+    var hasRouteDetectorObserver = false
+
     // Track if PiP is currently active (for both automatic and manual PiP)
     var isPipCurrentlyActive: Bool = false
 
@@ -28,15 +36,6 @@ import QuartzCore
     // This is true from when restoreUserInterfaceForPictureInPictureStop is called
     // until after didStopPictureInPicture completes
     var isPipRestoringUI: Bool = false
-
-    // FlutterPlatformView instances are kept strongly by the plugin registry until
-    // Dart explicitly unregisters them. This flag makes detach/deinit cleanup idempotent.
-    private var isPlatformViewDetached: Bool = false
-
-    // KVO removeObserver is not throwable; track registrations explicitly to
-    // prevent removing observers that were never added on shared/fullscreen views.
-    var hasPlayerItemObservers: Bool = false
-    var hasPlayerObservers: Bool = false
 
     // Track if we've already registered remote command handlers
     // This prevents re-registering and clearing targets unnecessarily
@@ -139,28 +138,19 @@ import QuartzCore
             player = sharedPlayer
             isSharedPlayer = alreadyExisted
 
+            // iOS PiP is bound to a concrete AVPlayerViewController. Creating extra
+            // AVPlayerViewController instances for Dart fullscreen/recreated inline views
+            // splits PiP/NowPlaying/remote-command ownership and breaks automatic PiP
+            // after fullscreen → background. Always reuse the single shared controller
+            // for this controllerId. Flutter/iOS will reparent its view as needed.
+            playerViewController = sharedViewController
+            isDartFullscreenView = isDartFullscreen
             if isDartFullscreen {
-                // Dart fullscreen host: use a dedicated AVPlayerViewController (same player) so the inline
-                // view never loses its shared view when this platform view is created or disposed.
-                let dedicatedVC = AVPlayerViewController()
-                dedicatedVC.player = sharedPlayer
-                playerViewController = dedicatedVC
-                isDartFullscreenView = true
-                print("✅ Created dedicated AVPlayerViewController for Dart fullscreen (controller ID: \(controllerIdValue))")
+                print("✅ Reusing shared AVPlayerViewController for Dart fullscreen (controller ID: \(controllerIdValue))")
+            } else if alreadyExisted {
+                print("♻️ Reusing shared AVPlayerViewController for controller ID: \(controllerIdValue)")
             } else {
-                if alreadyExisted {
-                    // Second or later platform view for this controller (e.g. detail screen).
-                    // Use a dedicated AVPlayerViewController with the shared player so this
-                    // view has its own layer; the shared VC stays in SharedPlayerManager for PiP.
-                    // This avoids black screen when navigating list↔detail (one UIView per slot).
-                    let displayVC = AVPlayerViewController()
-                    displayVC.player = sharedPlayer
-                    playerViewController = displayVC
-                    print("✅ Created dedicated AVPlayerViewController for shared controller (controller ID: \(controllerIdValue)) - avoids black screen when navigating list↔detail")
-                } else {
-                    playerViewController = sharedViewController
-                    print("✅ Created new shared player AND view controller for controller ID: \(controllerIdValue)")
-                }
+                print("✅ Created new shared player AND view controller for controller ID: \(controllerIdValue)")
             }
         } else {
             // Fallback: create new instances if no controller ID provided
@@ -267,19 +257,18 @@ import QuartzCore
                 let isActiveForAutoPiP = SharedPlayerManager.shared.isControllerActiveForAutoPiP(controllerIdValue)
                 let isPlaying = player?.rate ?? 0 > 0
 
-                if isDartFullscreenView || isActiveForAutoPiP || isPlaying {
-                    print("🎬 Controller state - dartFullscreen: \(isDartFullscreenView), activeForAutoPiP: \(isActiveForAutoPiP), isPlaying: \(isPlaying)")
+                if isActiveForAutoPiP || isPlaying {
+                    print("🎬 Controller state - activeForAutoPiP: \(isActiveForAutoPiP), isPlaying: \(isPlaying)")
                     if canStartPictureInPictureAutomatically {
                         // Check if manual PiP is active - if so, skip re-enabling automatic PiP
                         if SharedPlayerManager.shared.isManualPiPActive(controllerIdValue) {
                             print("   ⚠️ Skipping automatic PiP re-enable - manual PiP is active")
                         } else {
-                            // Dart fullscreen must become the primary PiP owner immediately.
-                            // It may be created after playback started, so relying on play/rate
-                            // events from this view is not reliable on iOS.
+                            // Set this new view as the primary view
                             SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
+                            // Re-apply automatic PiP settings to enable it on this new view
                             SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
-                            print("   → Set this view as primary and enabled automatic PiP (viewId: \(viewId))")
+                            print("   → Set new view as primary and enabled automatic PiP (viewId: \(viewId))")
                         }
                     } else {
                         print("   ⚠️ Cannot enable automatic PiP - canStartPictureInPictureAutomatically is false")
@@ -700,43 +689,52 @@ import QuartzCore
         return nil
     }
 
-    /// Detaches this platform view from controller-level ownership.
-    ///
-    /// This is called from Dart when the Flutter widget is disposed. Relying on
-    /// `deinit` is not enough because the plugin-level registry keeps a strong
-    /// reference to the view so method calls can be forwarded by viewId. Without
-    /// this explicit detach, old inline/fullscreen views keep KVO observers,
-    /// Now Playing ownership, app lifecycle observers, and automatic PiP state.
-    func detachPlatformView() {
-        if isPlatformViewDetached {
-            print("VideoPlayerView detach skipped for already detached viewId: \(viewId)")
+    /// Explicitly detaches this platform view without disposing the shared player/controller.
+    /// Full teardown remains controller-level via SharedPlayerManager.removePlayer().
+    /// This is intentionally safe to call multiple times from Dart dispose and Swift deinit.
+    func disposePlatformView() {
+        if isPlatformViewDisposed {
             return
         }
 
-        isPlatformViewDetached = true
-        print("Detaching VideoPlayerView for channel: \(channelName), viewId: \(viewId)")
+        isPlatformViewDisposed = true
+        print("🧹 Disposing platform view only for channel: \(channelName), viewId: \(viewId)")
 
-        let isPipActiveNow = isPipCurrentlyActive
-        if isPipActiveNow {
-            print("⚠️ View being detached while PiP is active - keeping PiP state alive")
-        }
-
-        // Platform view disposal is NOT controller disposal. Do not stop PiP,
-        // do not emit synthetic pipStop, and do not clear shared player state here.
+        // Do NOT synthesize pipStop and do NOT stop PiP here. Platform view disposal
+        // happens during Dart fullscreen transitions and should not change PiP state.
         cleanupRemoteCommandOwnership()
 
-        SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
+        if let controllerIdValue = controllerId {
+            let wasPrimaryView = SharedPlayerManager.shared.isPrimaryView(viewId, for: controllerIdValue)
+            let shouldKeepAutoPiP = SharedPlayerManager.shared.isControllerActiveForAutoPiP(controllerIdValue) || (player?.rate ?? 0 > 0)
+
+            playerViewController.canStartPictureInPictureAutomaticallyFromInline = false
+            SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
+            NativeVideoPlayerPlugin.unregisterView(withId: viewId)
+
+            if shouldKeepAutoPiP {
+                if #available(iOS 14.2, *) {
+                    SharedPlayerManager.shared.promotePrimaryViewIfNeeded(for: controllerIdValue, excluding: viewId)
+                    SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
+                }
+            } else if wasPrimaryView {
+                SharedPlayerManager.shared.promotePrimaryViewIfNeeded(for: controllerIdValue, excluding: viewId)
+            }
+        } else {
+            SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
+            NativeVideoPlayerPlugin.unregisterView(withId: viewId)
+        }
 
         if let timeObserver = timeObserver {
             player?.removeTimeObserver(timeObserver)
             self.timeObserver = nil
         }
 
-        if hasPlayerItemObservers, let item = player?.currentItem {
+        if hasItemObservers, let item = player?.currentItem {
             item.removeObserver(self, forKeyPath: "status")
             item.removeObserver(self, forKeyPath: "playbackBufferEmpty")
             item.removeObserver(self, forKeyPath: "playbackLikelyToKeepUp")
-            hasPlayerItemObservers = false
+            hasItemObservers = false
         }
 
         if hasPlayerObservers {
@@ -746,41 +744,30 @@ import QuartzCore
         }
 
         if #available(iOS 11.0, *) {
-            routeDetector?.removeObserver(self, forKeyPath: "multipleRoutesDetected")
+            if hasRouteDetectorObserver {
+                routeDetector?.removeObserver(self, forKeyPath: "multipleRoutesDetected")
+                hasRouteDetectorObserver = false
+            }
             routeDetector?.isRouteDetectionEnabled = false
             routeDetector = nil
         }
 
         NotificationCenter.default.removeObserver(self)
         methodChannel.setMethodCallHandler(nil)
+        eventSink = nil
 
         drmHandler?.cleanup()
         drmHandler = nil
-
         currentMediaInfo = nil
 
-        if let controllerIdValue = controllerId {
-            let remainingViews = SharedPlayerManager.shared.findAllViewsForController(controllerIdValue)
-            if !remainingViews.isEmpty {
-                print("📤 Emitting current state to \(remainingViews.count) remaining view(s) for controller \(controllerIdValue)")
-                for view in remainingViews where view.viewId != viewId {
-                    view.emitCurrentState()
-                }
-            }
-        }
-
-        if controllerId != nil && !isDartFullscreenView {
-            print("✅ Platform view detached but shared player kept alive for controller ID: \(String(describing: controllerId))")
-        } else if controllerId != nil && isDartFullscreenView {
-            print("✅ Dart fullscreen platform view detached - shared player kept alive for controller ID: \(String(describing: controllerId))")
-        } else {
-            print("Platform view detached for non-shared player")
-        }
+        // Do not nil playerViewController.player here. It is shared at controller-level
+        // and should survive fullscreen/inline platform view churn.
+        print("✅ Platform view detached; shared AVPlayerViewController kept alive for controller ID: \(String(describing: controllerId))")
     }
 
     deinit {
         print("VideoPlayerView deinit for channel: \(channelName), viewId: \(viewId)")
-        detachPlatformView()
+        disposePlatformView()
     }
 
     // MARK: - App Lifecycle Handling
@@ -792,17 +779,6 @@ import QuartzCore
 
         // Store current playback rate before iOS might pause it
         let wasPlaying = player?.rate ?? 0 > 0
-
-        // When backgrounding from Dart fullscreen, this fullscreen AVPlayerViewController
-        // must be the automatic PiP owner. Playback may have started from the inline view,
-        // so this fullscreen view may never receive a play call of its own.
-        if #available(iOS 14.2, *), isDartFullscreenView, let controllerIdValue = controllerId {
-            if canStartPictureInPictureAutomatically && wasPlaying {
-                print("🎬 Dart fullscreen entering background - forcing this view as automatic PiP owner")
-                SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
-                SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
-            }
-        }
 
         // CRITICAL: Ensure audio session stays active when screen locks
         // This prevents iOS from pausing the video

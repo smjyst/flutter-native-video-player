@@ -1,7 +1,6 @@
 import AVFoundation
 import AVKit
 import Flutter
-import MediaPlayer
 
 // MARK: - Shared Player Manager
 
@@ -265,18 +264,6 @@ class SharedPlayerManager: NSObject {
         // First stop all views using this player
         stopAllViewsForController(controllerId)
 
-        // Full controller-level media session cleanup. Platform view deinit must not do
-        // this because fullscreen views can be disposed while the controller should keep
-        // PiP/Now Playing alive. Explicit controller dispose is the correct teardown point.
-        RemoteCommandManager.shared.removeAllTargets()
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-        do {
-            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            print("🔇 [SharedPlayerManager] Deactivated audio session for controller ID: \(controllerId)")
-        } catch {
-            print("⚠️ [SharedPlayerManager] Failed to deactivate audio session: \(error.localizedDescription)")
-        }
-
         // Remove player from manager
         print("🧹 [SharedPlayerManager] Removing player from players dict for controllerId: \(controllerId)")
         players.removeValue(forKey: controllerId)
@@ -428,23 +415,32 @@ class SharedPlayerManager: NSObject {
     /// Unregister a VideoPlayerView when it's disposed
     func unregisterVideoPlayerView(viewId: Int64) {
         let key = "\(viewId)"
-        let controllerId = videoPlayerViews[key]?.view?.controllerId
+        let removedControllerId = videoPlayerViews[key]?.view?.controllerId
         videoPlayerViews.removeValue(forKey: key)
         print("   → Unregistered view with ID \(viewId), remaining views: \(videoPlayerViews.count)")
 
-        guard let controllerIdValue = controllerId else {
+        if let controllerId = removedControllerId,
+           primaryViewIdForController[controllerId] == viewId {
+            promotePrimaryViewIfNeeded(for: controllerId, excluding: viewId)
+        }
+    }
+
+    /// Promotes another active view as primary when the current primary platform view is disposed.
+    func promotePrimaryViewIfNeeded(for controllerId: Int, excluding excludedViewId: Int64) {
+        videoPlayerViews = videoPlayerViews.filter { $0.value.view != nil }
+
+        if let currentPrimary = primaryViewIdForController[controllerId],
+           currentPrimary != excludedViewId,
+           videoPlayerViews["\(currentPrimary)"]?.view != nil {
             return
         }
 
-        if primaryViewIdForController[controllerIdValue] == viewId {
-            let replacement = findAllViewsForController(controllerIdValue).last
-            if let replacement = replacement {
-                primaryViewIdForController[controllerIdValue] = replacement.viewId
-                print("   🎯 Primary view \(viewId) was disposed; promoted ViewId \(replacement.viewId) for controller \(controllerIdValue)")
-            } else {
-                primaryViewIdForController.removeValue(forKey: controllerIdValue)
-                print("   🎯 Primary view \(viewId) was disposed; no remaining views for controller \(controllerIdValue)")
-            }
+        if let nextView = findAnotherViewForController(controllerId, excluding: excludedViewId) {
+            primaryViewIdForController[controllerId] = nextView.viewId
+            print("   🎯 Promoted view \(nextView.viewId) as primary for controller \(controllerId)")
+        } else {
+            primaryViewIdForController.removeValue(forKey: controllerId)
+            print("   🧹 Cleared primary view for controller \(controllerId)")
         }
     }
 

@@ -3,21 +3,22 @@ import Foundation
 
 extension VideoPlayerView {
     func addObservers(to item: AVPlayerItem) {
-        if !hasPlayerItemObservers {
-            item.addObserver(self, forKeyPath: "status", options: [.new, .old], context: nil)
-            item.addObserver(self, forKeyPath: "playbackBufferEmpty", options: [.new], context: nil)
-            item.addObserver(self, forKeyPath: "playbackLikelyToKeepUp", options: [.new], context: nil)
-            hasPlayerItemObservers = true
+        if hasItemObservers || hasPlayerObservers {
+            print("⚠️ Observers already registered for view \(viewId), skipping duplicate registration")
+            return
         }
+
+        item.addObserver(self, forKeyPath: "status", options: [.new, .old], context: nil)
+        item.addObserver(self, forKeyPath: "playbackBufferEmpty", options: [.new], context: nil)
+        item.addObserver(self, forKeyPath: "playbackLikelyToKeepUp", options: [.new], context: nil)
+        hasItemObservers = true
 
         // Observe player's timeControlStatus to track play/pause state changes
-        if !hasPlayerObservers {
-            player?.addObserver(self, forKeyPath: "timeControlStatus", options: [.new, .old], context: nil)
+        player?.addObserver(self, forKeyPath: "timeControlStatus", options: [.new, .old], context: nil)
 
-            // Observe AirPlay connection status
-            player?.addObserver(self, forKeyPath: "externalPlaybackActive", options: [.new, .initial], context: nil)
-            hasPlayerObservers = true
-        }
+        // Observe AirPlay connection status
+        player?.addObserver(self, forKeyPath: "externalPlaybackActive", options: [.new, .initial], context: nil)
+        hasPlayerObservers = true
 
         // Observe audio route changes to detect AirPlay device changes
         NotificationCenter.default.addObserver(
@@ -310,6 +311,7 @@ extension VideoPlayerView {
             options: [.new, .initial],
             context: nil
         )
+        hasRouteDetectorObserver = true
 
         print("AirPlay route detector setup complete, multipleRoutesDetected: \(routeDetector?.multipleRoutesDetected ?? false)")
     }

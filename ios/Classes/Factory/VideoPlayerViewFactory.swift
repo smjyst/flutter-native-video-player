@@ -30,26 +30,25 @@ import UIKit
                 return
             }
 
-            if call.method == "disposeController" {
+            if call.method == "unregisterPlatformView" {
                 if let args = call.arguments as? [String: Any],
-                   let controllerId = args["controllerId"] as? Int {
-                    print("🗑️ Plugin-level disposeController for controllerId: \(controllerId)")
-                    SharedPlayerManager.shared.removePlayer(for: controllerId)
+                   let viewId = args["viewId"] as? Int64 {
+                    NativeVideoPlayerPlugin.unregisterPlatformView(withId: viewId)
                     result(nil)
                 } else {
-                    result(FlutterError(code: "INVALID_ARGUMENT", message: "Controller ID is required", details: nil))
+                    result(FlutterError(code: "INVALID_ARGUMENT", message: "View ID is required", details: nil))
                 }
                 return
             }
 
-            if call.method == "unregisterPlatformView" {
+            if call.method == "disposeController" {
                 if let args = call.arguments as? [String: Any],
-                   let viewId = args["viewId"] as? Int64 {
-                    print("🧹 Plugin-level unregisterPlatformView for viewId: \(viewId)")
-                    NativeVideoPlayerPlugin.unregisterView(withId: viewId)
+                   let controllerId = args["controllerId"] as? Int {
+                    SharedPlayerManager.shared.removePlayer(for: controllerId)
+                    NativeVideoPlayerPlugin.teardownControllerEventChannel(for: controllerId)
                     result(nil)
                 } else {
-                    result(FlutterError(code: "INVALID_ARGUMENT", message: "viewId is required", details: nil))
+                    result(FlutterError(code: "INVALID_ARGUMENT", message: "Controller ID is required", details: nil))
                 }
                 return
             }
@@ -94,8 +93,15 @@ import UIKit
     
     public static func unregisterView(withId viewId: Int64) {
         print("Unregistering view with id: \(viewId)")
+        registeredViews.removeValue(forKey: viewId)
+    }
+
+    public static func unregisterPlatformView(withId viewId: Int64) {
+        print("Explicitly unregistering platform view with id: \(viewId)")
         if let view = registeredViews[viewId] {
-            view.detachPlatformView()
+            view.disposePlatformView()
+        } else {
+            SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
         }
         registeredViews.removeValue(forKey: viewId)
     }
@@ -132,7 +138,6 @@ import UIKit
 
 class VideoPlayerViewFactory: NSObject, FlutterPlatformViewFactory {
     private var messenger: FlutterBinaryMessenger
-    private var views: [Int64: VideoPlayerView] = [:]
 
     init(messenger: FlutterBinaryMessenger) {
         self.messenger = messenger
@@ -151,10 +156,6 @@ class VideoPlayerViewFactory: NSObject, FlutterPlatformViewFactory {
             arguments: args,
             binaryMessenger: messenger
         )
-        // Do not keep a second strong reference in the factory. The plugin-level
-        // registry owns the view until Dart explicitly unregisters it on widget
-        // dispose. Keeping both caused disposed fullscreen/inline views to stay
-        // alive and fight over PiP/Now Playing ownership.
         NativeVideoPlayerPlugin.registerView(view, withId: viewId)
         return view
     }

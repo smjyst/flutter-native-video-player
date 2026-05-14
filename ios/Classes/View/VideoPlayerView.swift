@@ -257,15 +257,18 @@ import QuartzCore
             if #available(iOS 14.2, *) {
                 let isActiveForAutoPiP = SharedPlayerManager.shared.isControllerActiveForAutoPiP(controllerIdValue)
                 let isPlaying = player?.rate ?? 0 > 0
+                let shouldClaimAutoPiP = isDartFullscreenView || isActiveForAutoPiP || isPlaying
 
-                if isActiveForAutoPiP || isPlaying {
-                    print("🎬 Controller state - activeForAutoPiP: \(isActiveForAutoPiP), isPlaying: \(isPlaying)")
+                if shouldClaimAutoPiP {
+                    print("🎬 Controller state - dartFullscreen: \(isDartFullscreenView), activeForAutoPiP: \(isActiveForAutoPiP), isPlaying: \(isPlaying)")
                     if canStartPictureInPictureAutomatically {
                         // Check if manual PiP is active - if so, skip re-enabling automatic PiP
                         if SharedPlayerManager.shared.isManualPiPActive(controllerIdValue) {
                             print("   ⚠️ Skipping automatic PiP re-enable - manual PiP is active")
                         } else {
-                            // Set this new view as the primary view
+                            // Set this new view as the primary view. This is especially important
+                            // for Dart fullscreen: the previous inline view may still be primary,
+                            // but iOS automatic PiP must be enabled on the fullscreen AVPlayerViewController.
                             SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
                             // Re-apply automatic PiP settings to enable it on this new view
                             SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
@@ -870,6 +873,20 @@ import QuartzCore
             print("   → Audio session kept active during background/lock")
         } catch {
             print("   ⚠️ Failed to keep audio session active: \(error.localizedDescription)")
+        }
+
+        // When backgrounding from Dart fullscreen, make the currently visible
+        // fullscreen AVPlayerViewController own automatic PiP right before iOS decides
+        // whether to start PiP. Without this, the old inline view may remain primary and
+        // automatic PiP from fullscreen can silently fail.
+        if #available(iOS 14.2, *),
+           wasPlaying,
+           canStartPictureInPictureAutomatically,
+           let controllerIdValue = controllerId,
+           !SharedPlayerManager.shared.isManualPiPActive(controllerIdValue) {
+            SharedPlayerManager.shared.setPrimaryView(viewId, for: controllerIdValue)
+            SharedPlayerManager.shared.setAutomaticPiPEnabled(for: controllerIdValue, enabled: true)
+            print("   → Ensured this view owns automatic PiP before background (viewId: \(viewId), dartFullscreen: \(isDartFullscreenView))")
         }
 
         // CRITICAL: iOS will pause AVPlayer when screen locks

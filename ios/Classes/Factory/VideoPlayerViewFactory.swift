@@ -42,6 +42,18 @@ import UIKit
                 return
             }
 
+            if call.method == "unregisterPlatformView" {
+                if let args = call.arguments as? [String: Any],
+                   let viewId = args["viewId"] as? Int64 {
+                    print("🧹 Plugin-level unregisterPlatformView for viewId: \(viewId)")
+                    NativeVideoPlayerPlugin.unregisterView(withId: viewId)
+                    result(nil)
+                } else {
+                    result(FlutterError(code: "INVALID_ARGUMENT", message: "viewId is required", details: nil))
+                }
+                return
+            }
+
             // Forward view-level methods to the appropriate view
             if let args = call.arguments as? [String: Any],
                let viewId = args["viewId"] as? Int64,
@@ -82,6 +94,9 @@ import UIKit
     
     public static func unregisterView(withId viewId: Int64) {
         print("Unregistering view with id: \(viewId)")
+        if let view = registeredViews[viewId] {
+            view.detachPlatformView()
+        }
         registeredViews.removeValue(forKey: viewId)
     }
 
@@ -136,7 +151,10 @@ class VideoPlayerViewFactory: NSObject, FlutterPlatformViewFactory {
             arguments: args,
             binaryMessenger: messenger
         )
-        views[viewId] = view
+        // Do not keep a second strong reference in the factory. The plugin-level
+        // registry owns the view until Dart explicitly unregisters it on widget
+        // dispose. Keeping both caused disposed fullscreen/inline views to stay
+        // alive and fight over PiP/Now Playing ownership.
         NativeVideoPlayerPlugin.registerView(view, withId: viewId)
         return view
     }

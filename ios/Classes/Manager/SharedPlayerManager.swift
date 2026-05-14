@@ -428,8 +428,24 @@ class SharedPlayerManager: NSObject {
     /// Unregister a VideoPlayerView when it's disposed
     func unregisterVideoPlayerView(viewId: Int64) {
         let key = "\(viewId)"
+        let controllerId = videoPlayerViews[key]?.view?.controllerId
         videoPlayerViews.removeValue(forKey: key)
         print("   → Unregistered view with ID \(viewId), remaining views: \(videoPlayerViews.count)")
+
+        guard let controllerIdValue = controllerId else {
+            return
+        }
+
+        if primaryViewIdForController[controllerIdValue] == viewId {
+            let replacement = findAllViewsForController(controllerIdValue).last
+            if let replacement = replacement {
+                primaryViewIdForController[controllerIdValue] = replacement.viewId
+                print("   🎯 Primary view \(viewId) was disposed; promoted ViewId \(replacement.viewId) for controller \(controllerIdValue)")
+            } else {
+                primaryViewIdForController.removeValue(forKey: controllerIdValue)
+                print("   🎯 Primary view \(viewId) was disposed; no remaining views for controller \(controllerIdValue)")
+            }
+        }
     }
 
     /// Find another active view for a given controller (excluding a specific viewId)

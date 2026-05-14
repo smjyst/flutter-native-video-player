@@ -29,6 +29,15 @@ import QuartzCore
     // until after didStopPictureInPicture completes
     var isPipRestoringUI: Bool = false
 
+    // FlutterPlatformView instances are kept strongly by the plugin registry until
+    // Dart explicitly unregisters them. This flag makes detach/deinit cleanup idempotent.
+    private var isPlatformViewDetached: Bool = false
+
+    // KVO removeObserver is not throwable; track registrations explicitly to
+    // prevent removing observers that were never added on shared/fullscreen views.
+    var hasPlayerItemObservers: Bool = false
+    var hasPlayerObservers: Bool = false
+
     // Track if we've already registered remote command handlers
     // This prevents re-registering and clearing targets unnecessarily
     var hasRegisteredRemoteCommands: Bool = false
@@ -691,47 +700,51 @@ import QuartzCore
         return nil
     }
 
-    deinit {
-        print("VideoPlayerView deinit for channel: \(channelName), viewId: \(viewId)")
-
-        // Platform view disposal is NOT the same as controller disposal.
-        // A Dart fullscreen platform view can be destroyed when leaving fullscreen, but the
-        // controller/player/automatic PiP state must remain alive for the inline view and for
-        // the next fullscreen/background transition. Do not emit synthetic pipStop, do not
-        // stop PiP, and do not disable automatic PiP here.
-        let isPipActiveNow = isPipCurrentlyActive
-        if isPipActiveNow {
-            print("⚠️ View being disposed while PiP is active - keeping PiP state alive")
+    /// Detaches this platform view from controller-level ownership.
+    ///
+    /// This is called from Dart when the Flutter widget is disposed. Relying on
+    /// `deinit` is not enough because the plugin-level registry keeps a strong
+    /// reference to the view so method calls can be forwarded by viewId. Without
+    /// this explicit detach, old inline/fullscreen views keep KVO observers,
+    /// Now Playing ownership, app lifecycle observers, and automatic PiP state.
+    func detachPlatformView() {
+        if isPlatformViewDetached {
+            print("VideoPlayerView detach skipped for already detached viewId: \(viewId)")
+            return
         }
 
-        // Clean up remote command ownership (transfer to another view if possible)
+        isPlatformViewDetached = true
+        print("Detaching VideoPlayerView for channel: \(channelName), viewId: \(viewId)")
+
+        let isPipActiveNow = isPipCurrentlyActive
+        if isPipActiveNow {
+            print("⚠️ View being detached while PiP is active - keeping PiP state alive")
+        }
+
+        // Platform view disposal is NOT controller disposal. Do not stop PiP,
+        // do not emit synthetic pipStop, and do not clear shared player state here.
         cleanupRemoteCommandOwnership()
 
-        // Only unregister this platform view. Shared player and controller-level state
-        // are torn down explicitly by disposeController / SharedPlayerManager.removePlayer().
         SharedPlayerManager.shared.unregisterVideoPlayerView(viewId: viewId)
 
-        // Remove periodic time observer
         if let timeObserver = timeObserver {
             player?.removeTimeObserver(timeObserver)
             self.timeObserver = nil
         }
 
-        // Only remove observers, don't dispose the player if it's shared
-        // The shared player will be kept alive for reuse
-        if let item = player?.currentItem {
+        if hasPlayerItemObservers, let item = player?.currentItem {
             item.removeObserver(self, forKeyPath: "status")
             item.removeObserver(self, forKeyPath: "playbackBufferEmpty")
             item.removeObserver(self, forKeyPath: "playbackLikelyToKeepUp")
+            hasPlayerItemObservers = false
         }
 
-        // Remove player observer for timeControlStatus
-        player?.removeObserver(self, forKeyPath: "timeControlStatus")
+        if hasPlayerObservers {
+            player?.removeObserver(self, forKeyPath: "timeControlStatus")
+            player?.removeObserver(self, forKeyPath: "externalPlaybackActive")
+            hasPlayerObservers = false
+        }
 
-        // Remove player observer for externalPlaybackActive
-        player?.removeObserver(self, forKeyPath: "externalPlaybackActive")
-
-        // Remove route detector observer
         if #available(iOS 11.0, *) {
             routeDetector?.removeObserver(self, forKeyPath: "multipleRoutesDetected")
             routeDetector?.isRouteDetectionEnabled = false
@@ -741,60 +754,33 @@ import QuartzCore
         NotificationCenter.default.removeObserver(self)
         methodChannel.setMethodCallHandler(nil)
 
-        // Clean up DRM handler
         drmHandler?.cleanup()
         drmHandler = nil
 
-        // Clear current media info from this view
-        // BUT do NOT clear from SharedPlayerManager if PiP is active
-        // This ensures media controls survive view disposal during PiP
         currentMediaInfo = nil
-        if !isPipActiveNow {
-            // Only clear from SharedPlayerManager if PiP is NOT active
-            if let controllerIdValue = controllerId {
-                // But first check if there are other views using this controller
-                let otherViews = SharedPlayerManager.shared.findAllViewsForController(controllerIdValue)
-                if otherViews.count <= 1 {
-                    // This is the last view, safe to clear media info
-                    print("🧹 Clearing media info from SharedPlayerManager (last view)")
-                } else {
-                    print("📱 Keeping media info in SharedPlayerManager (other views exist)")
-                }
-            }
-        } else {
-            print("📱 Keeping media info in SharedPlayerManager (PiP is active)")
-        }
 
-        // Emit current state to all remaining views for this controller
-        // This ensures other views stay in sync when one view is disposed
         if let controllerIdValue = controllerId {
             let remainingViews = SharedPlayerManager.shared.findAllViewsForController(controllerIdValue)
             if !remainingViews.isEmpty {
                 print("📤 Emitting current state to \(remainingViews.count) remaining view(s) for controller \(controllerIdValue)")
-                for view in remainingViews {
-                    // Skip the view being disposed (just in case it's still in the list)
-                    if view.viewId != viewId {
-                        view.emitCurrentState()
-                    }
+                for view in remainingViews where view.viewId != viewId {
+                    view.emitCurrentState()
                 }
             }
         }
 
-        // Do not release the Dart fullscreen AVPlayerViewController's player here.
-        // Detaching it on fullscreen view disposal can break subsequent iOS automatic PiP
-        // ownership. Full teardown happens only on explicit controller.dispose().
-
-        // CRITICAL: For shared controllers, player and playerViewController are NOT disposed here
-        // They're managed by SharedPlayerManager and persist across platform view disposal
-        // This ensures PiP delegate callbacks continue to work when navigating between screens
-        // Resources will be disposed when controller.dispose() is called from Dart
         if controllerId != nil && !isDartFullscreenView {
-            print("✅ Platform view disposed but player AND view controller kept alive for controller ID: \(String(describing: controllerId))")
+            print("✅ Platform view detached but shared player kept alive for controller ID: \(String(describing: controllerId))")
         } else if controllerId != nil && isDartFullscreenView {
-            print("✅ Dart fullscreen platform view disposed - shared player/VC kept alive for controller ID: \(String(describing: controllerId))")
+            print("✅ Dart fullscreen platform view detached - shared player kept alive for controller ID: \(String(describing: controllerId))")
         } else {
-            print("Platform view disposed for non-shared player")
+            print("Platform view detached for non-shared player")
         }
+    }
+
+    deinit {
+        print("VideoPlayerView deinit for channel: \(channelName), viewId: \(viewId)")
+        detachPlatformView()
     }
 
     // MARK: - App Lifecycle Handling
